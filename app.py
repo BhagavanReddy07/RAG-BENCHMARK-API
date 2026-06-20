@@ -123,9 +123,12 @@ def initialize_db() -> None:
     
     conn.commit()
     
-    # Seed standard clinical nodes and edges if empty
+    # Seed standard clinical nodes and edges if empty or outdated
     cursor.execute("SELECT COUNT(*) FROM clinical_nodes;")
-    if cursor.fetchone()[0] == 0:
+    if cursor.fetchone()[0] < 10:
+        cursor.execute("DELETE FROM clinical_edges;")
+        cursor.execute("DELETE FROM clinical_nodes;")
+        
         nodes = [
             ("headache", "Symptom"),
             ("high bp", "Symptom"),
@@ -134,7 +137,12 @@ def initialize_db() -> None:
             ("rest", "Treatment"),
             ("monitor bp", "Treatment"),
             ("amlodipine", "Treatment"),
-            ("anxiety", "Symptom")
+            ("anxiety", "Symptom"),
+            ("nausea", "Symptom"),
+            ("sweating", "Symptom"),
+            ("shortness of breath", "Symptom"),
+            ("chest pain", "Symptom"),
+            ("heart attack", "Condition")
         ]
         
         edges = [
@@ -142,7 +150,11 @@ def initialize_db() -> None:
             ("hypertension", "high bp", "causes"),
             ("tension-type headache", "rest", "treatment"),
             ("hypertension", "monitor bp", "treatment"),
-            ("hypertension", "amlodipine", "treatment")
+            ("hypertension", "amlodipine", "treatment"),
+            ("heart attack", "chest pain", "causes"),
+            ("heart attack", "nausea", "causes"),
+            ("heart attack", "sweating", "causes"),
+            ("heart attack", "shortness of breath", "causes")
         ]
         
         cursor.executemany("INSERT OR IGNORE INTO clinical_nodes (id, type) VALUES (?, ?);", nodes)
