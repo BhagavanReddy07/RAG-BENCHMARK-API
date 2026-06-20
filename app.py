@@ -275,7 +275,8 @@ def retrieve_rag_data_local(
     user_id: int,
     use_linear: bool,
     use_vector: bool,
-    use_graph: bool
+    use_graph: bool,
+    similarity_threshold: float = 0.70
 ) -> RAGRetrieveResponse:
     initialize_db()
     
@@ -307,7 +308,7 @@ def retrieve_rag_data_local(
             })
         latency["linear"] = round((time.perf_counter() - t_lin_start) * 1000, 2)
         
-    # 2. Vector Read (In-memory Cosine Similarity)
+    # 2. Vector Read (In-memory Cosine Similarity with Similarity Thresholding & Time Decay)
     if use_vector:
         t_vec_start = time.perf_counter()
         if payload.query_vector:
@@ -323,16 +324,43 @@ def retrieve_rag_data_local(
             for id_val, snap_id, text_chunk, severity, created_at, emb_str in candidates:
                 emb = json.loads(emb_str)
                 sim = cosine_similarity(payload.query_vector, emb)
-                scored_candidates.append({
-                    "id": id_val,
-                    "snapshot_id": snap_id,
-                    "text_chunk": text_chunk,
-                    "severity": severity,
-                    "created_at": str(created_at),
-                    "similarity": round(sim, 4)
-                })
-            # Sort descending by similarity
-            scored_candidates.sort(key=lambda x: x["similarity"], reverse=True)
+                
+                # Apply time-decay decay boost (recency weighting)
+                decay_factor = 1.0
+                if created_at:
+                    try:
+                        from datetime import datetime, timezone
+                        dt_str = str(created_at).replace(" ", "T")
+                        if "+" in dt_str:
+                            dt = datetime.fromisoformat(dt_str)
+                        else:
+                            dt = datetime.fromisoformat(dt_str).replace(tzinfo=timezone.utc)
+                        
+                        now = datetime.now(timezone.utc)
+                        elapsed_days = (now - dt).days
+                        # Half-life = 180 days (decays similarity score slightly over time)
+                        # We apply a decay floor of 0.5 to prevent old matches from completely disappearing
+                        decay_factor = math.exp(-max(0, elapsed_days) / 180)
+                        decay_factor = max(0.5, decay_factor)
+                    except Exception:
+                        pass
+                
+                final_score = round(sim * decay_factor, 4)
+                
+                # Filter out candidates that do not meet the minimum similarity threshold
+                if sim >= similarity_threshold:
+                    scored_candidates.append({
+                        "id": id_val,
+                        "snapshot_id": snap_id,
+                        "text_chunk": text_chunk,
+                        "severity": severity,
+                        "created_at": str(created_at),
+                        "similarity": round(sim, 4),
+                        "decay_factor": round(decay_factor, 4),
+                        "score": final_score
+                    })
+            # Sort descending by the decay-adjusted final score
+            scored_candidates.sort(key=lambda x: x["score"], reverse=True)
             vector_results = scored_candidates[:5]
         latency["vector"] = round((time.perf_counter() - t_vec_start) * 1000, 2)
         
@@ -407,10 +435,11 @@ def api_retrieve(
     user_id: int = Query(9999, description="Patient user ID"),
     use_linear: bool = Query(True, description="Enable Linear retrieval"),
     use_vector: bool = Query(True, description="Enable Vector search retrieval"),
-    use_graph: bool = Query(True, description="Enable Graph traversal retrieval")
+    use_graph: bool = Query(True, description="Enable Graph traversal retrieval"),
+    similarity_threshold: float = Query(0.70, description="Minimum similarity score threshold")
 ):
     try:
-        return retrieve_rag_data_local(payload, user_id, use_linear, use_vector, use_graph)
+        return retrieve_rag_data_local(payload, user_id, use_linear, use_vector, use_graph, similarity_threshold)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
