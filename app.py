@@ -178,7 +178,7 @@ def cosine_similarity(v1: List[float], v2: List[float]) -> float:
 # 3. Store Implementation
 # ---------------------------------------------------------
 def store_rag_data_local(
-    payload: RAGStoreRequest,
+    payload: List[RAGStoreItem],
     user_id: int,
     use_linear: bool,
     use_vector: bool,
@@ -196,7 +196,7 @@ def store_rag_data_local(
     
     t_start = time.perf_counter()
     
-    for item in payload.items:
+    for item in payload:
         snapshot_id = str(item.id)
         item_user_id = item.user_id if item.user_id is not None else user_id
         
@@ -260,7 +260,7 @@ def store_rag_data_local(
     latency["total"] = round((time.perf_counter() - t_start) * 1000, 2)
     
     return RAGStoreResponse(
-        message=f"Successfully stored {len(payload.items)} item(s) in local SQLite database.",
+        message=f"Successfully stored {len(payload)} item(s) in local SQLite database.",
         stored_linear=stored_linear,
         stored_vector=stored_vector,
         stored_graph=stored_graph,
@@ -418,7 +418,7 @@ def read_root():
 
 @app.post("/store", response_model=RAGStoreResponse)
 def api_store(
-    payload: RAGStoreRequest,
+    payload: List[RAGStoreItem],
     user_id: int = Query(9999, description="Patient user ID"),
     use_linear: bool = Query(True, description="Enable Linear storage"),
     use_vector: bool = Query(True, description="Enable Vector embedding storage"),
@@ -471,27 +471,27 @@ def run_cli_tests():
     print("\n--- 1. Store API Benchmarks (Individual & Combined Combinations) ---")
     
     # Store A: Linear Only
-    req = RAGStoreRequest(items=[RAGStoreItem(id="test-1", text_chunk=clinical_note)])
+    req = [RAGStoreItem(id="test-1", text_chunk=clinical_note)]
     res = store_rag_data_local(req, user_id=user_id, use_linear=True, use_vector=False, use_graph=False)
     print(f"[*] Linear Store (Only): Success. Latency: {res.latency_ms}")
     
     # Store B: Vector Only
-    req = RAGStoreRequest(items=[RAGStoreItem(id="test-2", text_chunk=clinical_note, embedding=mock_vector)])
+    req = [RAGStoreItem(id="test-2", text_chunk=clinical_note, embedding=mock_vector)]
     res = store_rag_data_local(req, user_id=user_id, use_linear=False, use_vector=True, use_graph=False)
     print(f"[*] Vector Store (Only): Success. Latency: {res.latency_ms}")
     
     # Store C: Graph Only
-    req = RAGStoreRequest(items=[RAGStoreItem(id="test-3", text_chunk=clinical_note, graph_nodes=["headache", "high bp", "tension-type headache"])])
+    req = [RAGStoreItem(id="test-3", text_chunk=clinical_note, graph_nodes=["headache", "high bp", "tension-type headache"])]
     res = store_rag_data_local(req, user_id=user_id, use_linear=False, use_vector=False, use_graph=True)
     print(f"[*] Graph Store (Only): Success. Latency: {res.latency_ms}")
     
     # Store D: Vector + Graph Combination
-    req = RAGStoreRequest(items=[RAGStoreItem(id="test-4", text_chunk=clinical_note, embedding=mock_vector, graph_nodes=["headache", "high bp", "tension-type headache"])])
+    req = [RAGStoreItem(id="test-4", text_chunk=clinical_note, embedding=mock_vector, graph_nodes=["headache", "high bp", "tension-type headache"])]
     res = store_rag_data_local(req, user_id=user_id, use_linear=False, use_vector=True, use_graph=True)
     print(f"[*] Vector + Graph Store: Success. Latency: {res.latency_ms}")
     
     # Store E: All 3 (Linear + Vector + Graph) Combined
-    req = RAGStoreRequest(items=[RAGStoreItem(id="test-5", text_chunk=clinical_note, embedding=mock_vector, graph_nodes=["headache", "high bp", "tension-type headache"])])
+    req = [RAGStoreItem(id="test-5", text_chunk=clinical_note, embedding=mock_vector, graph_nodes=["headache", "high bp", "tension-type headache"])]
     res = store_rag_data_local(req, user_id=user_id, use_linear=True, use_vector=True, use_graph=True)
     print(f"[*] Linear + Vector + Graph Store: Success. Latency: {res.latency_ms}")
     
