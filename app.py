@@ -17,8 +17,12 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rag_benchmar
 # 1. Pydantic Schemas (Matching User Dataset Format)
 # ---------------------------------------------------------
 class RAGStoreItem(BaseModel):
-    id: str
+    id: Any
+    snapshot_id: Optional[int] = None
+    user_id: Optional[int] = None
     text_chunk: str
+    severity: Optional[str] = None
+    created_at: Optional[str] = None
     embedding: Optional[List[float]] = None
     graph_nodes: Optional[List[str]] = None
 
@@ -53,13 +57,26 @@ def initialize_db() -> None:
     # Enable foreign keys
     cursor.execute("PRAGMA foreign_keys = ON;")
     
+    # Drop existing tables if the schema is old (missing 'severity')
+    try:
+        cursor.execute("PRAGMA table_info(snapshots);")
+        columns = [r[1] for r in cursor.fetchall()]
+        if columns and "severity" not in columns:
+            cursor.execute("DROP TABLE IF EXISTS snapshot_embeddings;")
+            cursor.execute("DROP TABLE IF EXISTS patient_nodes;")
+            cursor.execute("DROP TABLE IF EXISTS snapshots;")
+    except Exception:
+        pass
+    
     # 1. Snapshots (Linear Store)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS snapshots (
             id TEXT PRIMARY KEY,
+            snapshot_id INTEGER,
             user_id INTEGER NOT NULL,
             text_chunk TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            severity TEXT,
+            created_at TIMESTAMP
         );
     """)
     
@@ -168,14 +185,18 @@ def store_rag_data_local(
     t_start = time.perf_counter()
     
     for item in payload.items:
-        snapshot_id = item.id
+        snapshot_id = str(item.id)
+        item_user_id = item.user_id if item.user_id is not None else user_id
         
         # 1. Base snapshot (Linear Store / Relational)
         t_linear_start = time.perf_counter()
         if use_linear or use_vector or use_graph:
             cursor.execute(
-                "INSERT OR REPLACE INTO snapshots (id, user_id, text_chunk) VALUES (?, ?, ?);",
-                (snapshot_id, user_id, item.text_chunk)
+                """
+                INSERT OR REPLACE INTO snapshots (id, snapshot_id, user_id, text_chunk, severity, created_at)
+                VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (snapshot_id, item.snapshot_id, item_user_id, item.text_chunk, item.severity, item.created_at)
             )
             stored_linear = use_linear
             latency["linear"] += (time.perf_counter() - t_linear_start) * 1000
@@ -210,10 +231,10 @@ def store_rag_data_local(
             for node in matched_nodes:
                 cursor.execute("INSERT OR IGNORE INTO clinical_nodes (id, type) VALUES (?, 'Symptom');", (node,))
                 # delete existing association to avoid duplication if re-stored
-                cursor.execute("DELETE FROM patient_nodes WHERE user_id = ? AND node_id = ?;", (user_id, node))
+                cursor.execute("DELETE FROM patient_nodes WHERE user_id = ? AND node_id = ?;", (item_user_id, node))
                 cursor.execute(
                     "INSERT INTO patient_nodes (user_id, node_id, relationship) VALUES (?, ?, 'suffers_from');",
-                    (user_id, node)
+                    (item_user_id, node)
                 )
                 stored_graph = True
             latency["graph"] += (time.perf_counter() - t_graph_start) * 1000
@@ -260,15 +281,17 @@ def retrieve_rag_data_local(
     if use_linear:
         t_lin_start = time.perf_counter()
         cursor.execute(
-            "SELECT id, text_chunk, created_at FROM snapshots WHERE user_id = ? ORDER BY created_at DESC LIMIT 5;",
+            "SELECT id, snapshot_id, text_chunk, severity, created_at FROM snapshots WHERE user_id = ? ORDER BY created_at DESC LIMIT 5;",
             (user_id,)
         )
         linear_results = []
         for r in cursor.fetchall():
             linear_results.append({
-                "snapshot_id": r[0],
-                "text_chunk": r[1],
-                "created_at": str(r[2])
+                "id": r[0],
+                "snapshot_id": r[1],
+                "text_chunk": r[2],
+                "severity": r[3],
+                "created_at": str(r[4])
             })
         latency["linear"] = round((time.perf_counter() - t_lin_start) * 1000, 2)
         
@@ -277,7 +300,7 @@ def retrieve_rag_data_local(
         t_vec_start = time.perf_counter()
         if payload.query_vector:
             cursor.execute("""
-                SELECT s.id, s.text_chunk, e.embedding
+                SELECT s.id, s.snapshot_id, s.text_chunk, s.severity, s.created_at, e.embedding
                 FROM snapshot_embeddings e
                 JOIN snapshots s ON e.snapshot_id = s.id
                 WHERE s.user_id = ?;
@@ -285,12 +308,15 @@ def retrieve_rag_data_local(
             candidates = cursor.fetchall()
             
             scored_candidates = []
-            for snapshot_id, text_chunk, emb_str in candidates:
+            for id_val, snap_id, text_chunk, severity, created_at, emb_str in candidates:
                 emb = json.loads(emb_str)
                 sim = cosine_similarity(payload.query_vector, emb)
                 scored_candidates.append({
-                    "snapshot_id": snapshot_id,
+                    "id": id_val,
+                    "snapshot_id": snap_id,
                     "text_chunk": text_chunk,
+                    "severity": severity,
+                    "created_at": str(created_at),
                     "similarity": round(sim, 4)
                 })
             # Sort descending by similarity
