@@ -21,10 +21,7 @@ class RAGStoreItem(BaseModel):
     snapshot_id: Optional[int] = None
     user_id: Optional[int] = None
     text_chunk: str
-    severity: Optional[str] = None
-    created_at: Optional[str] = None
     embedding: Optional[List[float]] = None
-    graph_nodes: Optional[List[str]] = None
 
 class RAGStoreRequest(BaseModel):
     items: List[RAGStoreItem]
@@ -200,6 +197,27 @@ def store_rag_data_local(
         snapshot_id = str(item.id)
         item_user_id = item.user_id if item.user_id is not None else user_id
         
+        # Automatically extract severity and created_at from text_chunk standard lines
+        severity = "moderate"
+        created_at = None
+        for line in item.text_chunk.split("\n"):
+            line_lower = line.lower().strip()
+            if line_lower.startswith("severity:"):
+                severity = line.split(":", 1)[1].strip().lower()
+            elif line_lower.startswith("session date:"):
+                date_str = line.split(":", 1)[1].strip()
+                try:
+                    from datetime import datetime
+                    dt = datetime.strptime(date_str, "%B %Y")
+                    # Store as ISO format
+                    created_at = dt.strftime("%Y-%m-%dT%H:%M:%S.000000+00:00")
+                except Exception:
+                    pass
+        
+        if not created_at:
+            from datetime import datetime, timezone
+            created_at = datetime.now(timezone.utc).isoformat()
+            
         # 1. Base snapshot (Linear Store / Relational)
         t_linear_start = time.perf_counter()
         if use_linear or use_vector or use_graph:
@@ -208,7 +226,7 @@ def store_rag_data_local(
                 INSERT OR REPLACE INTO snapshots (id, snapshot_id, user_id, text_chunk, severity, created_at)
                 VALUES (?, ?, ?, ?, ?, ?);
                 """,
-                (snapshot_id, item.snapshot_id, item_user_id, item.text_chunk, item.severity, item.created_at)
+                (snapshot_id, item.snapshot_id, item_user_id, item.text_chunk, severity, created_at)
             )
             stored_linear = use_linear
             latency["linear"] += (time.perf_counter() - t_linear_start) * 1000
@@ -230,15 +248,12 @@ def store_rag_data_local(
         if use_graph:
             t_graph_start = time.perf_counter()
             matched_nodes = []
-            if item.graph_nodes:
-                matched_nodes = item.graph_nodes
-            else:
-                text_lower = item.text_chunk.lower()
-                cursor.execute("SELECT id FROM clinical_nodes;")
-                all_node_ids = [r[0] for r in cursor.fetchall()]
-                for nid in all_node_ids:
-                    if nid.lower() in text_lower:
-                        matched_nodes.append(nid)
+            text_lower = item.text_chunk.lower()
+            cursor.execute("SELECT id FROM clinical_nodes;")
+            all_node_ids = [r[0] for r in cursor.fetchall()]
+            for nid in all_node_ids:
+                if nid.lower() in text_lower:
+                    matched_nodes.append(nid)
                         
             for node in matched_nodes:
                 cursor.execute("INSERT OR IGNORE INTO clinical_nodes (id, type) VALUES (?, 'Symptom');", (node,))
@@ -481,17 +496,17 @@ def run_cli_tests():
     print(f"[*] Vector Store (Only): Success. Latency: {res.latency_ms}")
     
     # Store C: Graph Only
-    req = [RAGStoreItem(id="test-3", text_chunk=clinical_note, graph_nodes=["headache", "high bp", "tension-type headache"])]
+    req = [RAGStoreItem(id="test-3", text_chunk=clinical_note)]
     res = store_rag_data_local(req, user_id=user_id, use_linear=False, use_vector=False, use_graph=True)
     print(f"[*] Graph Store (Only): Success. Latency: {res.latency_ms}")
     
     # Store D: Vector + Graph Combination
-    req = [RAGStoreItem(id="test-4", text_chunk=clinical_note, embedding=mock_vector, graph_nodes=["headache", "high bp", "tension-type headache"])]
+    req = [RAGStoreItem(id="test-4", text_chunk=clinical_note, embedding=mock_vector)]
     res = store_rag_data_local(req, user_id=user_id, use_linear=False, use_vector=True, use_graph=True)
     print(f"[*] Vector + Graph Store: Success. Latency: {res.latency_ms}")
     
     # Store E: All 3 (Linear + Vector + Graph) Combined
-    req = [RAGStoreItem(id="test-5", text_chunk=clinical_note, embedding=mock_vector, graph_nodes=["headache", "high bp", "tension-type headache"])]
+    req = [RAGStoreItem(id="test-5", text_chunk=clinical_note, embedding=mock_vector)]
     res = store_rag_data_local(req, user_id=user_id, use_linear=True, use_vector=True, use_graph=True)
     print(f"[*] Linear + Vector + Graph Store: Success. Latency: {res.latency_ms}")
     
