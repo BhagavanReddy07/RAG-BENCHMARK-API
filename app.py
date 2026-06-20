@@ -341,6 +341,15 @@ app = FastAPI(
     description="Offline local SQLite-based testbed comparing Linear, Vector, and Graph architectures dynamically."
 )
 
+@app.get("/")
+def read_root():
+    return {
+        "status": "healthy",
+        "message": "Standalone Isolated RAG Benchmarks API is running!",
+        "docs_url": "/docs",
+        "endpoints": ["POST /store", "POST /retrieve"]
+    }
+
 @app.post("/store", response_model=RAGStoreResponse)
 def api_store(
     payload: RAGStoreRequest,
