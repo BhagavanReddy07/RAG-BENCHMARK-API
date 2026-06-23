@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY app.py .
+COPY rag_benchmark.db .
 
 # Expose port (commonly 8080 or dynamic $PORT)
 EXPOSE 8080

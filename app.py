@@ -17,10 +17,15 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rag_benchmar
 # 1. Pydantic Schemas (Matching User Dataset Format)
 # ---------------------------------------------------------
 class RAGStoreItem(BaseModel):
-    id: Any
+    id: Optional[Any] = None
     snapshot_id: Optional[int] = None
+    session_id: Optional[int] = None
     user_id: Optional[int] = None
     text_chunk: str
+    heal_time: Optional[int] = None
+    healing_until: Optional[str] = None
+    status: Optional[str] = None
+    created_at: Optional[str] = None
     embedding: Optional[List[float]] = None
 
 class RAGStoreRequest(BaseModel):
@@ -30,6 +35,7 @@ class RAGStoreResponse(BaseModel):
     message: str
     stored_linear: bool
     stored_vector: bool
+    stored_bm25: bool
     stored_graph: bool
     latency_ms: Dict[str, float]
 
@@ -41,6 +47,7 @@ class RAGRetrieveResponse(BaseModel):
     linear_results: Optional[List[Dict[str, Any]]] = None
     vector_results: Optional[List[Dict[str, Any]]] = None
     graph_results: Optional[List[Dict[str, Any]]] = None
+    formatted_llm_context: Optional[str] = None  # Formatted text context for LLM prompt
     latency_ms: Dict[str, float]
 
 # ---------------------------------------------------------
@@ -54,26 +61,35 @@ def initialize_db() -> None:
     # Enable foreign keys
     cursor.execute("PRAGMA foreign_keys = ON;")
     
-    # Drop existing tables if the schema is old (missing 'severity')
+    # Drop existing tables if the schema is old (missing 'severity' or composite keys)
     try:
         cursor.execute("PRAGMA table_info(snapshots);")
         columns = [r[1] for r in cursor.fetchall()]
-        if columns and "severity" not in columns:
+        cursor.execute("PRAGMA table_info(snapshot_embeddings);")
+        emb_columns = [r[1] for r in cursor.fetchall()]
+        
+        if (columns and "heal_time" not in columns) or (columns and "severity" not in columns) or (emb_columns and "user_id" not in emb_columns):
             cursor.execute("DROP TABLE IF EXISTS snapshot_embeddings;")
             cursor.execute("DROP TABLE IF EXISTS patient_nodes;")
             cursor.execute("DROP TABLE IF EXISTS snapshots;")
+            cursor.execute("DROP TABLE IF EXISTS snapshots_fts;")
     except Exception:
         pass
     
     # 1. Snapshots (Linear Store)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS snapshots (
-            id TEXT PRIMARY KEY,
+            id TEXT NOT NULL,
             snapshot_id INTEGER,
             user_id INTEGER NOT NULL,
+            session_id INTEGER,
             text_chunk TEXT NOT NULL,
             severity TEXT,
-            created_at TIMESTAMP
+            heal_time INTEGER,
+            healing_until TEXT,
+            status TEXT,
+            created_at TIMESTAMP,
+            PRIMARY KEY (id, user_id)
         );
     """)
     
@@ -82,8 +98,20 @@ def initialize_db() -> None:
         CREATE TABLE IF NOT EXISTS snapshot_embeddings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             snapshot_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
             embedding TEXT NOT NULL,
-            FOREIGN KEY (snapshot_id) REFERENCES snapshots (id) ON DELETE CASCADE
+            FOREIGN KEY (snapshot_id, user_id) REFERENCES snapshots (id, user_id) ON DELETE CASCADE
+        );
+    """)
+
+    # 2b. BM25 Full-Text Search (SQLite FTS5 — equivalent of PostgreSQL ts_rank_cd)
+    # Porter stemming tokenizer: 'chest pain' also matches 'chest painful', 'pain' etc.
+    cursor.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS snapshots_fts USING fts5(
+            snapshot_id UNINDEXED,
+            user_id UNINDEXED,
+            text_chunk,
+            tokenize = 'porter ascii'
         );
     """)
     
@@ -171,6 +199,37 @@ def cosine_similarity(v1: List[float], v2: List[float]) -> float:
         return 0.0
     return dot_product / (magnitude1 * magnitude2)
 
+# Helper: RRF (Reciprocal Rank Fusion) — same algorithm as production rag_service.py
+# Merges vector ranked list + BM25 ranked list into a single fused ranking.
+# k=60 is standard (same as production). Higher k = less aggressive fusion.
+def rrf_fuse(vector_results: list, bm25_results: list, k: int = 60) -> list:
+    from collections import defaultdict
+    scores = defaultdict(lambda: {"rrf": 0.0, "vector_score": 0.0, "bm25_score": 0.0, "data": None})
+
+    for rank, item in enumerate(vector_results, 1):
+        doc_id = item["id"]
+        scores[doc_id]["rrf"] += 1.0 / (k + rank)
+        scores[doc_id]["vector_score"] = item.get("similarity", 0.0)
+        scores[doc_id]["data"] = item
+
+    for rank, item in enumerate(bm25_results, 1):
+        doc_id = item["id"]
+        scores[doc_id]["rrf"] += 1.0 / (k + rank)
+        scores[doc_id]["bm25_score"] = item.get("bm25_score", 0.0)
+        if scores[doc_id]["data"] is None:
+            scores[doc_id]["data"] = item
+
+    sorted_ids = sorted(scores.keys(), key=lambda x: scores[x]["rrf"], reverse=True)
+    result = []
+    for doc_id in sorted_ids[:3]:
+        s = scores[doc_id]
+        merged = {**s["data"]}
+        merged["rrf_score"]    = round(s["rrf"], 6)
+        merged["vector_score"] = round(s["vector_score"], 4)
+        merged["bm25_score"]   = round(s["bm25_score"], 4)
+        result.append(merged)
+    return result
+
 # ---------------------------------------------------------
 # 3. Store Implementation
 # ---------------------------------------------------------
@@ -179,72 +238,110 @@ def store_rag_data_local(
     user_id: int,
     use_linear: bool,
     use_vector: bool,
-    use_graph: bool
+    use_graph: bool,
+    use_bm25: bool = True   # BM25 is auto-stored alongside linear (no extra cost)
 ) -> RAGStoreResponse:
     initialize_db()
     
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    latency = {"linear": 0.0, "vector": 0.0, "graph": 0.0, "total": 0.0}
+    latency = {"linear": 0.0, "vector": 0.0, "bm25": 0.0, "graph": 0.0, "total": 0.0}
     stored_linear = False
     stored_vector = False
-    stored_graph = False
+    stored_bm25   = False
+    stored_graph  = False
     
     t_start = time.perf_counter()
     
     for item in payload:
-        snapshot_id = str(item.id)
+        snapshot_id = str(item.id or item.snapshot_id)
         item_user_id = item.user_id if item.user_id is not None else user_id
         
-        # Automatically extract severity and created_at from text_chunk standard lines
+        # Automatically extract severity and created_at from text_chunk standard lines or properties
         severity = "moderate"
-        created_at = None
-        for line in item.text_chunk.split("\n"):
-            line_lower = line.lower().strip()
-            if line_lower.startswith("severity:"):
-                severity = line.split(":", 1)[1].strip().lower()
-            elif line_lower.startswith("session date:"):
-                date_str = line.split(":", 1)[1].strip()
-                try:
-                    from datetime import datetime
-                    dt = datetime.strptime(date_str, "%B %Y")
-                    # Store as ISO format
-                    created_at = dt.strftime("%Y-%m-%dT%H:%M:%S.000000+00:00")
-                except Exception:
-                    pass
+        text_lower = item.text_chunk.lower()
+        if "severe" in text_lower:
+            severity = "severe"
+        elif "mild" in text_lower:
+            severity = "mild"
+            
+        created_at = item.created_at
+        if not created_at:
+            for line in item.text_chunk.split("\n"):
+                line_lower = line.lower().strip()
+                if line_lower.startswith("severity:"):
+                    severity = line.split(":", 1)[1].strip().lower()
+                elif line_lower.startswith("session date:"):
+                    date_str = line.split(":", 1)[1].strip()
+                    try:
+                        from datetime import datetime
+                        dt = datetime.strptime(date_str, "%B %Y")
+                        # Store as ISO format
+                        created_at = dt.strftime("%Y-%m-%dT%H:%M:%S.000000+00:00")
+                    except Exception:
+                        pass
         
         if not created_at:
             from datetime import datetime, timezone
             created_at = datetime.now(timezone.utc).isoformat()
             
         # 1. Base snapshot (Linear Store / Relational)
+        # INSERT OR IGNORE — once stored, a snapshot is permanent and never overwritten.
+        # If the same (id, user_id) is submitted again it is silently skipped.
         t_linear_start = time.perf_counter()
         if use_linear or use_vector or use_graph:
             cursor.execute(
                 """
-                INSERT OR REPLACE INTO snapshots (id, snapshot_id, user_id, text_chunk, severity, created_at)
-                VALUES (?, ?, ?, ?, ?, ?);
+                INSERT OR IGNORE INTO snapshots (id, snapshot_id, user_id, session_id, text_chunk, severity, heal_time, healing_until, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
-                (snapshot_id, item.snapshot_id, item_user_id, item.text_chunk, severity, created_at)
+                (
+                    snapshot_id, 
+                    item.snapshot_id, 
+                    item_user_id, 
+                    item.session_id, 
+                    item.text_chunk, 
+                    severity, 
+                    item.heal_time, 
+                    item.healing_until, 
+                    item.status, 
+                    created_at
+                )
             )
             stored_linear = use_linear
             latency["linear"] += (time.perf_counter() - t_linear_start) * 1000
             
         # 2. Vector Store
+        # INSERT OR IGNORE — skip silently if embedding already exists for this snapshot.
         if use_vector:
             t_vec_start = time.perf_counter()
             if item.embedding:
-                # delete old embedding first to avoid duplicate keys if replaced
-                cursor.execute("DELETE FROM snapshot_embeddings WHERE snapshot_id = ?;", (snapshot_id,))
                 cursor.execute(
-                    "INSERT INTO snapshot_embeddings (snapshot_id, embedding) VALUES (?, ?);",
-                    (snapshot_id, json.dumps(item.embedding))
+                    "INSERT OR IGNORE INTO snapshot_embeddings (snapshot_id, user_id, embedding) VALUES (?, ?, ?);",
+                    (snapshot_id, item_user_id, json.dumps(item.embedding))
                 )
                 stored_vector = True
             latency["vector"] += (time.perf_counter() - t_vec_start) * 1000
             
-        # 3. Graph Store
+        # 3. BM25 Full-Text Store (FTS5)
+        # Only insert if this snapshot is not already in the FTS index.
+        if use_bm25 or use_linear:
+            t_bm25_start = time.perf_counter()
+            cursor.execute(
+                "SELECT COUNT(*) FROM snapshots_fts WHERE snapshot_id = ? AND user_id = ?;",
+                (snapshot_id, item_user_id)
+            )
+            already_exists = cursor.fetchone()[0] > 0
+            if not already_exists:
+                cursor.execute(
+                    "INSERT INTO snapshots_fts (snapshot_id, user_id, text_chunk) VALUES (?, ?, ?);",
+                    (snapshot_id, item_user_id, item.text_chunk)
+                )
+            stored_bm25 = True
+            latency["bm25"] += (time.perf_counter() - t_bm25_start) * 1000
+
+        # 4. Graph Store
         if use_graph:
             t_graph_start = time.perf_counter()
             matched_nodes = []
@@ -271,13 +368,15 @@ def store_rag_data_local(
     
     latency["linear"] = round(latency["linear"], 2)
     latency["vector"] = round(latency["vector"], 2)
-    latency["graph"] = round(latency["graph"], 2)
-    latency["total"] = round((time.perf_counter() - t_start) * 1000, 2)
+    latency["bm25"]   = round(latency["bm25"],   2)
+    latency["graph"]  = round(latency["graph"],  2)
+    latency["total"]  = round((time.perf_counter() - t_start) * 1000, 2)
     
     return RAGStoreResponse(
         message=f"Successfully stored {len(payload)} item(s) in local SQLite database.",
         stored_linear=stored_linear,
         stored_vector=stored_vector,
+        stored_bm25=stored_bm25,
         stored_graph=stored_graph,
         latency_ms=latency
     )
@@ -291,17 +390,20 @@ def retrieve_rag_data_local(
     use_linear: bool,
     use_vector: bool,
     use_graph: bool,
-    similarity_threshold: float = 0.70
+    use_bm25: bool = True,
+    similarity_threshold: float = 0.35
 ) -> RAGRetrieveResponse:
     initialize_db()
     
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    latency = {"linear": 0.0, "vector": 0.0, "graph": 0.0, "total": 0.0}
+    latency = {"linear": 0.0, "vector": 0.0, "bm25": 0.0, "rrf": 0.0, "graph": 0.0, "total": 0.0}
     linear_results = None
     vector_results = None
-    graph_results = None
+    bm25_results   = None
+    rrf_results    = None
+    graph_results  = None
     
     t_start = time.perf_counter()
     
@@ -309,7 +411,7 @@ def retrieve_rag_data_local(
     if use_linear:
         t_lin_start = time.perf_counter()
         cursor.execute(
-            "SELECT id, snapshot_id, text_chunk, severity, created_at FROM snapshots WHERE user_id = ? ORDER BY created_at DESC LIMIT 5;",
+            "SELECT id, snapshot_id, session_id, text_chunk, severity, heal_time, healing_until, status, created_at FROM snapshots WHERE user_id = ? ORDER BY created_at DESC LIMIT 3;",
             (user_id,)
         )
         linear_results = []
@@ -317,9 +419,13 @@ def retrieve_rag_data_local(
             linear_results.append({
                 "id": r[0],
                 "snapshot_id": r[1],
-                "text_chunk": r[2],
-                "severity": r[3],
-                "created_at": str(r[4])
+                "session_id": r[2],
+                "text_chunk": r[3],
+                "severity": r[4],
+                "heal_time": r[5],
+                "healing_until": r[6],
+                "status": r[7],
+                "created_at": str(r[8])
             })
         latency["linear"] = round((time.perf_counter() - t_lin_start) * 1000, 2)
         
@@ -328,15 +434,15 @@ def retrieve_rag_data_local(
         t_vec_start = time.perf_counter()
         if payload.query_vector:
             cursor.execute("""
-                SELECT s.id, s.snapshot_id, s.text_chunk, s.severity, s.created_at, e.embedding
+                SELECT s.id, s.snapshot_id, s.session_id, s.text_chunk, s.severity, s.heal_time, s.healing_until, s.status, s.created_at, e.embedding
                 FROM snapshot_embeddings e
-                JOIN snapshots s ON e.snapshot_id = s.id
+                JOIN snapshots s ON e.snapshot_id = s.id AND e.user_id = s.user_id
                 WHERE s.user_id = ?;
             """, (user_id,))
             candidates = cursor.fetchall()
             
             scored_candidates = []
-            for id_val, snap_id, text_chunk, severity, created_at, emb_str in candidates:
+            for id_val, snap_id, session_id, text_chunk, severity, heal_time, healing_until, status, created_at, emb_str in candidates:
                 emb = json.loads(emb_str)
                 sim = cosine_similarity(payload.query_vector, emb)
                 
@@ -367,8 +473,12 @@ def retrieve_rag_data_local(
                     scored_candidates.append({
                         "id": id_val,
                         "snapshot_id": snap_id,
+                        "session_id": session_id,
                         "text_chunk": text_chunk,
                         "severity": severity,
+                        "heal_time": heal_time,
+                        "healing_until": healing_until,
+                        "status": status,
                         "created_at": str(created_at),
                         "similarity": round(sim, 4),
                         "decay_factor": round(decay_factor, 4),
@@ -376,34 +486,170 @@ def retrieve_rag_data_local(
                     })
             # Sort descending by the decay-adjusted final score
             scored_candidates.sort(key=lambda x: x["score"], reverse=True)
-            vector_results = scored_candidates[:5]
+            vector_results = scored_candidates[:3]
         latency["vector"] = round((time.perf_counter() - t_vec_start) * 1000, 2)
         
-    # 3. Graph Read
+    # 3. BM25 Read (SQLite FTS5 keyword search with Porter stemming)
+    if use_bm25:
+        t_bm25_start = time.perf_counter()
+        try:
+            # Sanitize query — remove non-alpha tokens to avoid FTS5 syntax errors
+            clean_tokens = [t for t in payload.query.split() if t.isalpha()]
+            fts_query = " ".join(clean_tokens) if clean_tokens else payload.query
+
+            cursor.execute("""
+                SELECT
+                    f.snapshot_id,
+                    f.user_id,
+                    s.snapshot_id  AS snap_id_int,
+                    s.text_chunk,
+                    s.severity,
+                    s.created_at,
+                    s.session_id,
+                    s.heal_time,
+                    s.healing_until,
+                    s.status,
+                    -bm25(snapshots_fts) AS bm25_score
+                FROM snapshots_fts f
+                JOIN snapshots s ON s.id = f.snapshot_id AND s.user_id = f.user_id
+                WHERE snapshots_fts MATCH ?
+                  AND f.user_id = ?
+                ORDER BY bm25_score DESC
+                LIMIT 3;
+            """, (fts_query, user_id))
+            rows = cursor.fetchall()
+            bm25_results = [
+                {
+                    "id":          r[0],
+                    "snapshot_id": r[2],
+                    "text_chunk":  r[3],
+                    "severity":    r[4],
+                    "created_at":  str(r[5]),
+                    "session_id":  r[6],
+                    "heal_time":   r[7],
+                    "healing_until": r[8],
+                    "status":      r[9],
+                    "bm25_score":  round(r[10], 4),
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            bm25_results = [{"error": str(e)}]
+        latency["bm25"] = round((time.perf_counter() - t_bm25_start) * 1000, 2)
+
+    # 3b. RRF Fusion — mirrors production rag_service.py FULL OUTER JOIN behavior.
+    # Runs when EITHER side has results (not both required).
+    # If BM25 returns 0 hits, vector results still get RRF scores (and vice versa).
+    # Only skips if both are empty.
+    if use_vector and use_bm25 and (vector_results or bm25_results):
+        t_rrf_start = time.perf_counter()
+        rrf_results = rrf_fuse(vector_results or [], bm25_results or [])
+        latency["rrf"] = round((time.perf_counter() - t_rrf_start) * 1000, 2)
+        # Overwrite vector_results with RRF fused results as the final hybrid search results
+        vector_results = rrf_results
+
+
+    # 4. Graph Read (Query-Focused Traversal)
     if use_graph:
         t_graph_start = time.perf_counter()
-        cursor.execute("SELECT node_id, relationship FROM patient_nodes WHERE user_id = ?;", (user_id,))
-        pat_nodes = cursor.fetchall()
         
-        if pat_nodes:
-            node_ids = [p[0] for p in pat_nodes]
-            placeholders = ",".join("?" for _ in node_ids)
-            # Query connections where either source or target matches any of patient nodes
+        # A. Extract search terms from query and find matching vocabulary in DB
+        query_words = [w.strip(",.?()[]").lower() for w in payload.query.split() if len(w) > 2]
+        cursor.execute("SELECT id FROM clinical_nodes;")
+        all_vocab_ids = [r[0] for r in cursor.fetchall()]
+        
+        query_node_ids = []
+        for word in query_words:
+            for vid in all_vocab_ids:
+                if word in vid.lower() or vid.lower() in word:
+                    if vid not in query_node_ids:
+                        query_node_ids.append(vid)
+                        
+        # B. Get all patient graph nodes
+        cursor.execute("SELECT node_id, relationship FROM patient_nodes WHERE user_id = ?;", (user_id,))
+        patient_links = {r[0]: r[1] for r in cursor.fetchall()}
+        
+        if query_node_ids and patient_links:
+            # C. Fetch edges connected to matched query terms
+            placeholders = ",".join("?" for _ in query_node_ids)
             cursor.execute(f"""
                 SELECT source, target, relationship
                 FROM clinical_edges
                 WHERE source IN ({placeholders}) OR target IN ({placeholders});
-            """, node_ids + node_ids)
+            """, query_node_ids + query_node_ids)
             edges = cursor.fetchall()
             
+            # D. Filter to only include nodes/edges that the patient actually has
+            filtered_edges = []
+            matched_nodes = set(query_node_ids)
+            for src, tgt, rel in edges:
+                src_ok = (src in patient_links) or (src in query_node_ids)
+                tgt_ok = (tgt in patient_links) or (tgt in query_node_ids)
+                if src_ok and tgt_ok:
+                    filtered_edges.append({"source": src, "target": tgt, "relationship": rel})
+                    matched_nodes.add(src)
+                    matched_nodes.add(tgt)
+                    
+            # Keep patient links that are part of this query subgraph
+            filtered_patient_nodes = [
+                {"node_id": nid, "relationship": patient_links.get(nid, "suffers_from")}
+                for nid in matched_nodes if nid in patient_links
+            ]
+            
             graph_results = [{
-                "patient_nodes": [{"node_id": p[0], "relationship": p[1]} for p in pat_nodes],
-                "clinical_connections": [{"source": e[0], "target": e[1], "relationship": e[2]} for e in edges]
+                "patient_nodes": filtered_patient_nodes,
+                "clinical_connections": filtered_edges
             }]
         else:
             graph_results = []
+            
         latency["graph"] = round((time.perf_counter() - t_graph_start) * 1000, 2)
         
+    # Format unified context to feed directly into the LLM
+    formatted_parts = []
+    
+    # 1. Timeline History (Linear)
+    if use_linear and linear_results:
+        timeline_txt = ["=== Patient History Timeline ==="]
+        for r in linear_results:
+            timeline_txt.append(
+                f"- Session #{r.get('session_id') or 'N/A'} (Date: {r.get('created_at') or 'Unknown'}, Status: {r.get('status') or 'unknown'}):\n"
+                f"  Note: {r.get('text_chunk').strip()}\n"
+                f"  Heal Time: {r.get('heal_time') or 'N/A'} days (Healing until: {r.get('healing_until') or 'N/A'})"
+            )
+        formatted_parts.append("\n".join(timeline_txt))
+        
+    # 2. Similar Cases (Vector / RRF)
+    # Use RRF fused if both vector and bm25 were active, otherwise vector
+    similar_cases = rrf_results if (use_vector and use_bm25 and rrf_results) else (vector_results if use_vector else None)
+    if similar_cases:
+        cases_txt = ["=== Similar Cases (Semantic Search) ==="]
+        for r in similar_cases[:3]:
+            score_type = "RRF Score" if (use_vector and use_bm25 and rrf_results) else "Similarity"
+            score_val = r.get("rrf_score") or r.get("score") or r.get("similarity") or 0.0
+            cases_txt.append(
+                f"- Case #{r.get('snapshot_id') or 'N/A'} ({score_type}: {score_val}, Status: {r.get('status') or 'unknown'}):\n"
+                f"  Note: {r.get('text_chunk').strip()}"
+            )
+        formatted_parts.append("\n".join(cases_txt))
+        
+    # 3. Clinical Knowledge Graph
+    if use_graph and graph_results and len(graph_results) > 0:
+        g = graph_results[0]
+        if g.get("patient_nodes") or g.get("clinical_connections"):
+            graph_txt = ["=== Clinical Knowledge Graph Context ==="]
+            if g.get("patient_nodes"):
+                graph_txt.append("* Patient Symptoms & Conditions:")
+                for n in g["patient_nodes"]:
+                    graph_txt.append(f"  - {n['node_id']} (Relationship: {n['relationship']})")
+            if g.get("clinical_connections"):
+                graph_txt.append("* Clinical Relationships Map:")
+                for c in g["clinical_connections"]:
+                    graph_txt.append(f"  - {c['source']} --[{c['relationship']}]--> {c['target']}")
+            formatted_parts.append("\n".join(graph_txt))
+            
+    formatted_llm_context = "\n\n".join(formatted_parts) if formatted_parts else None
+
     conn.close()
     latency["total"] = round((time.perf_counter() - t_start) * 1000, 2)
     
@@ -411,6 +657,7 @@ def retrieve_rag_data_local(
         linear_results=linear_results,
         vector_results=vector_results,
         graph_results=graph_results,
+        formatted_llm_context=formatted_llm_context,
         latency_ms=latency
     )
 
@@ -428,8 +675,50 @@ def read_root():
         "status": "healthy",
         "message": "Standalone Isolated RAG Benchmarks API is running!",
         "docs_url": "/docs",
-        "endpoints": ["POST /store", "POST /retrieve"]
+        "endpoints": ["POST /store", "POST /retrieve", "GET /stats"]
     }
+
+@app.get("/stats")
+def get_stats():
+    initialize_db()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Get count of snapshots per user_id
+    cursor.execute("SELECT user_id, count(*) FROM snapshots GROUP BY user_id;")
+    snapshots_counts = {str(row[0]): row[1] for row in cursor.fetchall()}
+    
+    # Get count of embeddings per user_id
+    cursor.execute("""
+        SELECT s.user_id, count(e.id) 
+        FROM snapshots s 
+        LEFT JOIN snapshot_embeddings e ON s.id = e.snapshot_id AND s.user_id = e.user_id
+        GROUP BY s.user_id;
+    """)
+    embeddings_counts = {str(row[0]): row[1] for row in cursor.fetchall()}
+    
+    # Get count of patient graph nodes per user_id
+    cursor.execute("SELECT user_id, count(*) FROM patient_nodes GROUP BY user_id;")
+    patient_nodes_counts = {str(row[0]): row[1] for row in cursor.fetchall()}
+    
+    conn.close()
+    
+    # Combine stats per user
+    all_users = set(list(snapshots_counts.keys()) + list(embeddings_counts.keys()) + list(patient_nodes_counts.keys()))
+    user_stats = {}
+    for uid in all_users:
+        user_stats[uid] = {
+            "snapshots_count": snapshots_counts.get(uid, 0),
+            "embeddings_count": embeddings_counts.get(uid, 0),
+            "graph_patient_nodes_count": patient_nodes_counts.get(uid, 0)
+        }
+        
+    return {
+        "database_path": DB_PATH,
+        "total_snapshots": sum(snapshots_counts.values()),
+        "users": user_stats
+    }
+
 
 @app.post("/store", response_model=RAGStoreResponse)
 def api_store(
@@ -444,17 +733,25 @@ def api_store(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/retrieve", response_model=RAGRetrieveResponse)
+@app.post("/retrieve", response_model=RAGRetrieveResponse, response_model_exclude_none=True)
 def api_retrieve(
     payload: RAGRetrieveRequest,
     user_id: int = Query(9999, description="Patient user ID"),
     use_linear: bool = Query(True, description="Enable Linear retrieval"),
     use_vector: bool = Query(True, description="Enable Vector search retrieval"),
     use_graph: bool = Query(True, description="Enable Graph traversal retrieval"),
-    similarity_threshold: float = Query(0.70, description="Minimum similarity score threshold")
+    similarity_threshold: float = Query(0.35, description="Minimum similarity score threshold for vector")
 ):
     try:
-        return retrieve_rag_data_local(payload, user_id, use_linear, use_vector, use_graph, similarity_threshold)
+        return retrieve_rag_data_local(
+            payload=payload,
+            user_id=user_id,
+            use_linear=use_linear,
+            use_vector=use_vector,
+            use_graph=use_graph,
+            use_bm25=True,
+            similarity_threshold=similarity_threshold
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -522,7 +819,7 @@ def run_cli_tests():
     res_ret = retrieve_rag_data_local(req_ret, user_id=user_id, use_linear=False, use_vector=True, use_graph=False)
     print(f"[*] Vector Retrieve: Found {len(res_ret.vector_results or [])} items. Latency: {res_ret.latency_ms}")
     if res_ret.vector_results:
-        print(f"    Top Match Cosine Similarity: {res_ret.vector_results[0]['similarity']}")
+        print(f"    Top Match Cosine Similarity: {res_ret.vector_results[0].get('similarity') or res_ret.vector_results[0].get('vector_score', 0.0)}")
         
     # Retrieve C: Graph Only
     req_ret = RAGRetrieveRequest(query="headache and high bp")
