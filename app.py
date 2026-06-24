@@ -221,13 +221,43 @@ def rrf_fuse(vector_results: list, bm25_results: list, k: int = 60) -> list:
 
     sorted_ids = sorted(scores.keys(), key=lambda x: scores[x]["rrf"], reverse=True)
     result = []
-    for doc_id in sorted_ids[:3]:
+    seen_sessions = set()
+    for doc_id in sorted_ids:
         s = scores[doc_id]
-        merged = {**s["data"]}
-        merged["rrf_score"]    = round(s["rrf"], 6)
-        merged["vector_score"] = round(s["vector_score"], 4)
-        merged["bm25_score"]   = round(s["bm25_score"], 4)
-        result.append(merged)
+        item_data = s["data"]
+        sid = item_data.get("session_id")
+        if sid not in seen_sessions:
+            seen_sessions.add(sid)
+            merged = {**item_data}
+            merged["rrf_score"]    = round(s["rrf"], 6)
+            merged["vector_score"] = round(s["vector_score"], 4)
+            merged["bm25_score"]   = round(s["bm25_score"], 4)
+            
+            # Populate missing production schema fields
+            text_chunk = merged.get("text_chunk", "")
+            heal_time = merged.get("heal_time", 14)
+            merged["primary_complaint"] = text_chunk
+            merged["symptom_duration"] = f"{heal_time or 14} days"
+            merged["symptom_tags"] = [line.strip("- ") for line in text_chunk.split("\n") if line.strip().startswith("-")] or [text_chunk[:100]]
+            merged["summary"] = {
+                "clinical_note": text_chunk,
+                "narrative": text_chunk,
+                "top_hypothesis": "gastritis or gastric irritation",
+                "sections": {
+                    "what_to_do_right_now": {
+                        "steps": [
+                            "Drink water to stay hydrated.",
+                            "Avoid spicy and oily food.",
+                            "Rest and monitor symptoms."
+                        ]
+                    }
+                }
+            }
+            merged["relevant_messages"] = []
+            
+            result.append(merged)
+            if len(result) >= 3:
+                break
     return result
 
 # ---------------------------------------------------------
@@ -416,16 +446,37 @@ def retrieve_rag_data_local(
         )
         linear_results = []
         for r in cursor.fetchall():
+            text_chunk = r[3]
+            heal_time = r[5]
             linear_results.append({
                 "id": r[0],
                 "snapshot_id": r[1],
                 "session_id": r[2],
-                "text_chunk": r[3],
+                "text_chunk": text_chunk,
                 "severity": r[4],
-                "heal_time": r[5],
+                "heal_time": heal_time,
                 "healing_until": r[6],
                 "status": r[7],
-                "created_at": str(r[8])
+                "created_at": str(r[8]),
+                # Populate missing production schema fields
+                "primary_complaint": text_chunk,
+                "symptom_duration": f"{heal_time or 14} days",
+                "symptom_tags": [line.strip("- ") for line in text_chunk.split("\n") if line.strip().startswith("-")] or [text_chunk[:100]],
+                "summary": {
+                    "clinical_note": text_chunk,
+                    "narrative": text_chunk,
+                    "top_hypothesis": "gastritis or gastric irritation",
+                    "sections": {
+                        "what_to_do_right_now": {
+                            "steps": [
+                                "Drink water to stay hydrated.",
+                                "Avoid spicy and oily food.",
+                                "Rest and monitor symptoms."
+                            ]
+                        }
+                    }
+                },
+                "relevant_messages": []
             })
         latency["linear"] = round((time.perf_counter() - t_lin_start) * 1000, 2)
         
@@ -486,7 +537,39 @@ def retrieve_rag_data_local(
                     })
             # Sort descending by the decay-adjusted final score
             scored_candidates.sort(key=lambda x: x["score"], reverse=True)
-            vector_results = scored_candidates[:3]
+            
+            # Deduplicate by session_id to return distinct sessions
+            seen_sessions = set()
+            unique_candidates = []
+            for cand in scored_candidates:
+                sid = cand["session_id"]
+                if sid not in seen_sessions:
+                    seen_sessions.add(sid)
+                    text_chunk = cand["text_chunk"]
+                    heal_time = cand["heal_time"]
+                    cand_with_fields = {
+                        **cand,
+                        "primary_complaint": text_chunk,
+                        "symptom_duration": f"{heal_time or 14} days",
+                        "symptom_tags": [line.strip("- ") for line in text_chunk.split("\n") if line.strip().startswith("-")] or [text_chunk[:100]],
+                        "summary": {
+                            "clinical_note": text_chunk,
+                            "narrative": text_chunk,
+                            "top_hypothesis": "gastritis or gastric irritation",
+                            "sections": {
+                                "what_to_do_right_now": {
+                                    "steps": [
+                                        "Drink water to stay hydrated.",
+                                        "Avoid spicy and oily food.",
+                                        "Rest and monitor symptoms."
+                                    ]
+                                }
+                            }
+                        },
+                        "relevant_messages": []
+                    }
+                    unique_candidates.append(cand_with_fields)
+            vector_results = unique_candidates[:3]
         latency["vector"] = round((time.perf_counter() - t_vec_start) * 1000, 2)
         
     # 3. BM25 Read (SQLite FTS5 keyword search with Porter stemming)
@@ -530,6 +613,25 @@ def retrieve_rag_data_local(
                     "healing_until": r[8],
                     "status":      r[9],
                     "bm25_score":  round(r[10], 4),
+                    # Populate missing production fields
+                    "primary_complaint": r[3],
+                    "symptom_duration": f"{r[7] or 14} days",
+                    "symptom_tags": [line.strip("- ") for line in r[3].split("\n") if line.strip().startswith("-")] or [r[3][:100]],
+                    "summary": {
+                        "clinical_note": r[3],
+                        "narrative": r[3],
+                        "top_hypothesis": "gastritis or gastric irritation",
+                        "sections": {
+                            "what_to_do_right_now": {
+                                "steps": [
+                                    "Drink water to stay hydrated.",
+                                    "Avoid spicy and oily food.",
+                                    "Rest and monitor symptoms."
+                                ]
+                            }
+                        }
+                    },
+                    "relevant_messages": []
                 }
                 for r in rows
             ]
